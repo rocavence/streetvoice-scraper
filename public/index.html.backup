@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreetVoice 資料擷取工具</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }
+
+        .header {
+            background: #2c3e50;
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            opacity: 0.8;
+            font-size: 1.1rem;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .upload-section {
+            border: 2px dashed #ddd;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 30px;
+            transition: border-color 0.3s;
+        }
+
+        .upload-section:hover {
+            border-color: #667eea;
+        }
+
+        .upload-section.dragover {
+            border-color: #667eea;
+            background: #f8f9ff;
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        .upload-btn {
+            background: #667eea;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background 0.3s;
+        }
+
+        .upload-btn:hover {
+            background: #5a67d8;
+        }
+
+        .options-section {
+            margin-bottom: 30px;
+        }
+
+        .options-title {
+            font-size: 1.3rem;
+            margin-bottom: 20px;
+            color: #2c3e50;
+        }
+
+        .checkbox-group {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .checkbox-item {
+            display: flex;
+            align-items: center;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border: 2px solid transparent;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .checkbox-item:hover {
+            border-color: #667eea;
+            background: #f0f4ff;
+        }
+
+        .checkbox-item input[type="checkbox"] {
+            margin-right: 12px;
+            transform: scale(1.2);
+        }
+
+        .checkbox-label {
+            font-weight: 500;
+            color: #2c3e50;
+        }
+
+        .checkbox-description {
+            color: #666;
+            font-size: 0.9rem;
+            margin-left: 24px;
+            margin-top: 5px;
+        }
+
+        .process-btn {
+            width: 100%;
+            background: #27ae60;
+            color: white;
+            padding: 15px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            cursor: pointer;
+            transition: background 0.3s;
+            margin-bottom: 20px;
+        }
+
+        .process-btn:hover:not(:disabled) {
+            background: #229954;
+        }
+
+        .process-btn:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+        }
+
+        .progress-section {
+            display: none;
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .progress-bar {
+            background: #e9ecef;
+            border-radius: 10px;
+            height: 20px;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+
+        .progress-fill {
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s;
+        }
+
+        .progress-text {
+            text-align: center;
+            font-weight: 500;
+            color: #2c3e50;
+        }
+
+        .status-log {
+            max-height: 200px;
+            overflow-y: auto;
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 0.9rem;
+            margin-top: 15px;
+        }
+
+        .download-section {
+            display: none;
+            text-align: center;
+            padding: 20px;
+            background: #d4edda;
+            border-radius: 8px;
+            border: 1px solid #c3e6cb;
+        }
+
+        .download-btn {
+            background: #28a745;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 10px;
+        }
+
+        .download-btn:hover {
+            background: #218838;
+        }
+
+        .file-info {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎵 StreetVoice 資料擷取工具</h1>
+            <p>上傳 Excel 檔案，自動擷取歌詞和音樂人資訊</p>
+        </div>
+
+        <div class="content">
+            <div class="upload-section" id="uploadSection">
+                <h3>📁 選擇 Excel 檔案</h3>
+                <p style="margin: 15px 0; color: #666;">支援 .xlsx 格式，需包含作品名稱和作者欄位</p>
+                <input type="file" id="fileInput" class="file-input" accept=".xlsx" />
+                <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
+                    選擇檔案
+                </button>
+                <div style="margin-top: 15px; color: #999; font-size: 0.9rem;">
+                    或將檔案拖拽到此處
+                </div>
+            </div>
+
+            <div class="file-info" id="fileInfo">
+                <h4>📋 檔案資訊</h4>
+                <p id="fileDetails"></p>
+            </div>
+
+            <div class="options-section">
+                <h3 class="options-title">⚙️ 擷取選項</h3>
+                <div class="checkbox-group">
+                    <label class="checkbox-item">
+                        <input type="checkbox" id="lyricsOption" value="lyrics" checked>
+                        <div>
+                            <div class="checkbox-label">歌詞</div>
+                            <div class="checkbox-description">從作品頁面擷取完整歌詞內容</div>
+                        </div>
+                    </label>
+
+                    <label class="checkbox-item">
+                        <input type="checkbox" id="categoryOption" value="category" checked>
+                        <div>
+                            <div class="checkbox-label">音樂人類別</div>
+                            <div class="checkbox-description">擷取音樂人的類別標籤（如：樂團、歌手等）</div>
+                        </div>
+                    </label>
+
+                    <label class="checkbox-item">
+                        <input type="checkbox" id="bioOption" value="bio" checked>
+                        <div>
+                            <div class="checkbox-label">音樂人介紹</div>
+                            <div class="checkbox-description">擷取音樂人的完整介紹和社群連結</div>
+                        </div>
+                    </label>
+                </div>
+            </div>
+
+            <button class="process-btn" id="processBtn" disabled onclick="startProcessing()">
+                🚀 開始處理
+            </button>
+
+            <div class="progress-section" id="progressSection">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="progress-text" id="progressText">準備中...</div>
+                <div class="status-log" id="statusLog"></div>
+            </div>
+
+            <div class="download-section" id="downloadSection">
+                <h4>✅ 處理完成！</h4>
+                <p>您的檔案已成功處理，點擊下方按鈕下載結果。</p>
+                <a href="#" class="download-btn" id="downloadBtn">📥 下載處理後的 Excel</a>
+            </div>
+
+            <div id="alertContainer"></div>
+        </div>
+    </div>
+
+    <script>
+        let selectedFile = null;
+        let processing = false;
+
+        // File upload handling
+        const fileInput = document.getElementById('fileInput');
+        const uploadSection = document.getElementById('uploadSection');
+        const fileInfo = document.getElementById('fileInfo');
+        const processBtn = document.getElementById('processBtn');
+
+        fileInput.addEventListener('change', handleFileSelect);
+
+        // Drag and drop
+        uploadSection.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadSection.classList.add('dragover');
+        });
+
+        uploadSection.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+        });
+
+        uploadSection.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFile(files[0]);
+            }
+        });
+
+        function handleFileSelect(e) {
+            const file = e.target.files[0];
+            if (file) {
+                handleFile(file);
+            }
+        }
+
+        function handleFile(file) {
+            if (!file.name.endsWith('.xlsx')) {
+                showAlert('請選擇 .xlsx 格式的 Excel 檔案', 'error');
+                return;
+            }
+
+            selectedFile = file;
+            document.getElementById('fileDetails').textContent =
+                `檔案名稱: ${file.name} | 大小: ${(file.size / 1024 / 1024).toFixed(2)} MB`;
+            fileInfo.style.display = 'block';
+            processBtn.disabled = false;
+        }
+
+        async function startProcessing() {
+            if (!selectedFile) {
+                showAlert('請先選擇檔案', 'error');
+                return;
+            }
+
+            const selectedOptions = getSelectedOptions();
+            if (selectedOptions.length === 0) {
+                showAlert('請至少選擇一個擷取選項', 'error');
+                return;
+            }
+
+            processing = true;
+            processBtn.disabled = true;
+            processBtn.textContent = '處理中...';
+
+            const progressSection = document.getElementById('progressSection');
+            const downloadSection = document.getElementById('downloadSection');
+
+            progressSection.style.display = 'block';
+            downloadSection.style.display = 'none';
+
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+            formData.append('options', JSON.stringify(selectedOptions));
+
+            try {
+                const response = await fetch('/process', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    const result = await response.blob();
+                    const downloadUrl = URL.createObjectURL(result);
+
+                    document.getElementById('downloadBtn').href = downloadUrl;
+                    document.getElementById('downloadBtn').download = `processed_${selectedFile.name}`;
+
+                    downloadSection.style.display = 'block';
+                    progressSection.style.display = 'none';
+
+                    showAlert('檔案處理完成！', 'success');
+                } else {
+                    const error = await response.text();
+                    throw new Error(error);
+                }
+            } catch (error) {
+                showAlert(`處理失敗: ${error.message}`, 'error');
+                progressSection.style.display = 'none';
+            } finally {
+                processing = false;
+                processBtn.disabled = false;
+                processBtn.textContent = '🚀 開始處理';
+            }
+        }
+
+        function getSelectedOptions() {
+            const options = [];
+            if (document.getElementById('lyricsOption').checked) options.push('lyrics');
+            if (document.getElementById('categoryOption').checked) options.push('category');
+            if (document.getElementById('bioOption').checked) options.push('bio');
+            return options;
+        }
+
+        function showAlert(message, type) {
+            const alertContainer = document.getElementById('alertContainer');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+
+            alertContainer.appendChild(alert);
+
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+
+        // WebSocket for real-time progress updates
+        function connectWebSocket() {
+            const ws = new WebSocket('ws://localhost:3000/ws');
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                updateProgress(data.progress, data.status, data.log);
+            };
+        }
+
+        function updateProgress(progress, status, log) {
+            document.getElementById('progressFill').style.width = `${progress}%`;
+            document.getElementById('progressText').textContent = status;
+
+            if (log) {
+                const statusLog = document.getElementById('statusLog');
+                statusLog.innerHTML += `${new Date().toLocaleTimeString()}: ${log}\n`;
+                statusLog.scrollTop = statusLog.scrollHeight;
+            }
+        }
+
+        // Initialize WebSocket connection
+        // connectWebSocket();
+    </script>
+</body>
+</html>

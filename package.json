@@ -1,0 +1,32 @@
+{
+  "name": "streetvoice-scraper",
+  "version": "1.0.0",
+  "description": "Web tool to scrape StreetVoice song lyrics and artist info from Excel files",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.18.2",
+    "fs": "^0.0.1-security",
+    "multer": "^1.4.5-lts.1",
+    "path": "^0.12.7",
+    "puppeteer": "^24.40.0",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "streetvoice",
+    "scraper",
+    "excel",
+    "lyrics",
+    "music"
+  ],
+  "author": "",
+  "license": "MIT"
+}
