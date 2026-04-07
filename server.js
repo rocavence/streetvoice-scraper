@@ -1,7 +1,8 @@
 const express = require('express');
 const multer = require('multer');
 const ExcelJS = require('exceljs');
-const puppeteer = require('puppeteer');
+const axios = require('axios');
+const cheerio = require('cheerio');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
@@ -19,10 +20,9 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000;
 
 // ====== Configuration ======
-const CONCURRENCY = 3; // Number of parallel browser pages
-const REQUEST_DELAY = 500; // ms between requests (per page)
-const PAGE_TIMEOUT = 30000; // ms to wait for page load
-const SELECTOR_TIMEOUT = 8000; // ms to wait for a selector
+const CONCURRENCY = 3; // Number of parallel requests
+const REQUEST_DELAY = 1000; // ms between requests to avoid rate limiting
+const REQUEST_TIMEOUT = 30000; // ms timeout for HTTP requests
 
 // Middleware
 app.use(cors());
@@ -44,69 +44,19 @@ const upload = multer({
     }
 });
 
-// Global variables
-let browser = null;
+// ====== HTTP Client Setup ======
 
-// Initialize browser
-async function initBrowser() {
-    if (!browser) {
-        browser = await puppeteer.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-extensions',
-                '--disable-plugins',
-                '--disable-images' // Skip loading images for speed
-            ],
-            defaultViewport: { width: 1280, height: 720 },
-            timeout: 60000
-        });
-    }
-    return browser;
-}
-
-// Create a pool of reusable pages
-async function createPagePool(size) {
-    const pages = [];
-    for (let i = 0; i < size; i++) {
-        const page = await browser.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        // Block unnecessary resources for speed
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            const type = req.resourceType();
-            if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
-                req.abort();
-            } else {
-                req.continue();
-            }
-        });
-        pages.push(page);
-    }
-    return pages;
-}
-
-// Close page pool
-async function closePagePool(pages) {
-    for (const page of pages) {
-        try { await page.close(); } catch (e) { /* ignore */ }
-    }
-}
-
-// Clean up browser on exit
-process.on('exit', async () => {
-    if (browser) {
-        await browser.close();
+// Create axios instance with default settings
+const axiosInstance = axios.create({
+    timeout: REQUEST_TIMEOUT,
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
     }
 });
 
@@ -158,95 +108,80 @@ async function parseExcelFile(filePath) {
     return { workbook, worksheet, headers, data, songNameCol, artistCol };
 }
 
-// ====== Optimized Scraping Functions ======
+// ====== HTTP-based Scraping Functions ======
 
-async function scrapeLyrics(page, songUrl) {
+async function scrapeLyrics(songUrl) {
     try {
         console.log(`  擷取歌詞: ${songUrl}`);
 
-        await page.goto(songUrl, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+        // Make HTTP request to get the page HTML
+        const response = await axiosInstance.get(songUrl);
+        const $ = cheerio.load(response.data);
 
-        // Wait for the actual content container instead of blind timeout
-        try {
-            await page.waitForSelector('.work-page-container-right, .song-content, [class*="lyrics"], [class*="work"]', {
-                timeout: SELECTOR_TIMEOUT
-            });
-        } catch (e) {
-            // Content area not found, wait a brief moment and continue
-            await new Promise(r => setTimeout(r, 1500));
+        // Extract lyrics using multiple strategies
+        let lyrics = null;
+
+        // Strategy 1: Look for work-page-container-right
+        const rightContainer = $('.work-page-container-right');
+        if (rightContainer.length > 0) {
+            let text = rightContainer.text().trim();
+            if (text && text.length > 50) {
+                // Clean up the text
+                text = text.replace(/\.\.\.查看更多[\s\S]*$/g, '');
+                text = text.replace(/查看更多[\s\S]*$/g, '');
+                text = text.replace(/收合[\s\S]*$/g, '');
+
+                const lines = text.split('\n')
+                    .map(l => l.trim())
+                    .filter(l => {
+                        if (!l) return false;
+                        if (l === '歌詞') return false;
+                        const noise = ['編輯推薦', '發布時間', '街聲', 'StreetVoice', '追蹤', '分享', '播放', '登入', '好聽', '留言', '收聽次數'];
+                        return !noise.some(n => l.includes(n));
+                    });
+
+                const cleaned = lines.join('\n').trim();
+                if (cleaned.length > 50 && /[\u4e00-\u9fff]/.test(cleaned)) {
+                    lyrics = cleaned;
+                }
+            }
         }
 
-        // Try clicking "查看更多" if it exists
-        try {
-            const expanded = await page.evaluate(() => {
-                const allEls = document.querySelectorAll('*');
-                for (const el of allEls) {
-                    const text = el.textContent ? el.textContent.trim() : '';
-                    if (text === '查看更多' || text === '...查看更多') {
-                        el.click();
-                        return true;
-                    }
-                }
-                // Also try expand buttons
-                const btns = document.querySelectorAll('button, a, span, div[onclick]');
-                for (const btn of btns) {
-                    const t = btn.textContent ? btn.textContent.trim() : '';
-                    if (t.includes('更多') || t.includes('展開') || t.includes('完整')) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                return false;
-            });
-
-            if (expanded) {
-                // Wait briefly for content to expand
-                await new Promise(r => setTimeout(r, 1500));
+        // Strategy 2: Look for meta description (often contains lyrics preview)
+        if (!lyrics) {
+            const metaDescription = $('meta[property="og:description"]').attr('content');
+            if (metaDescription && metaDescription.length > 50 && /[\u4e00-\u9fff]/.test(metaDescription)) {
+                lyrics = metaDescription.trim();
             }
-        } catch (e) { /* ignore */ }
+        }
 
-        // Extract lyrics
-        const lyrics = await page.evaluate(() => {
-            // Strategy 1: work-page-container-right
-            const rightContainer = document.querySelector('.work-page-container-right');
-            if (rightContainer) {
-                let text = rightContainer.textContent.trim();
-                if (text && text.length > 50) {
-                    text = text.replace(/\.\.\.查看更多[\s\S]*$/g, '');
-                    text = text.replace(/查看更多[\s\S]*$/g, '');
-                    text = text.replace(/收合[\s\S]*$/g, '');
-
-                    const lines = text.split('\n')
-                        .map(l => l.trim())
-                        .filter(l => {
-                            if (!l) return false;
-                            if (l === '歌詞') return false;
-                            const noise = ['編輯推薦', '發布時間', '街聲', 'StreetVoice', '追蹤', '分享', '播放', '登入', '好聽', '留言'];
-                            return !noise.some(n => l.includes(n));
-                        });
-
-                    const cleaned = lines.join('\n').trim();
-                    if (cleaned.length > 50 && /[\u4e00-\u9fff]/.test(cleaned)) {
-                        return cleaned;
-                    }
-                }
-            }
-
-            // Strategy 2: Find longest Chinese text block
+        // Strategy 3: Look for any element with substantial Chinese text
+        if (!lyrics) {
             let best = '';
-            const allEls = document.querySelectorAll('*');
-            for (const el of allEls) {
-                const t = el.textContent ? el.textContent.trim() : '';
-                if (t.length > 200 && t.length < 3000 && /[\u4e00-\u9fff]/.test(t)
-                    && !t.includes('Copyright') && !t.includes('街聲') && !t.includes('登入')) {
-                    let clean = t.replace(/\.\.\.查看更多[\s\S]*$/g, '').replace(/查看更多[\s\S]*$/g, '').replace(/收合[\s\S]*$/g, '').replace(/歌詞\s*/, '');
-                    const lines = clean.split('\n').map(l => l.trim()).filter(l => l && l !== '歌詞' && !l.includes('編輯') && !l.includes('發布時間') && !l.includes('街聲') && !l.includes('追蹤') && !l.includes('分享'));
+            $('*').each((i, el) => {
+                const text = $(el).text().trim();
+                if (text.length > 100 && text.length < 5000 && /[\u4e00-\u9fff]/.test(text)
+                    && !text.includes('Copyright') && !text.includes('街聲') && !text.includes('登入')
+                    && !text.includes('關於') && !text.includes('追蹤')) {
+
+                    let clean = text.replace(/\.\.\.查看更多[\s\S]*$/g, '')
+                                  .replace(/查看更多[\s\S]*$/g, '')
+                                  .replace(/收合[\s\S]*$/g, '')
+                                  .replace(/歌詞\s*/, '');
+
+                    const lines = clean.split('\n')
+                        .map(l => l.trim())
+                        .filter(l => l && l !== '歌詞' && !l.includes('編輯') && !l.includes('發布時間')
+                                 && !l.includes('街聲') && !l.includes('追蹤') && !l.includes('分享'));
+
                     const final = lines.join('\n').trim();
-                    if (final.length > best.length && final.length > 100) best = final;
+                    if (final.length > best.length && final.length > 100) {
+                        best = final;
+                    }
                 }
-            }
-            return best || null;
-        });
+            });
+            lyrics = best || null;
+        }
 
         return lyrics || '未找到歌詞';
     } catch (error) {
@@ -255,86 +190,105 @@ async function scrapeLyrics(page, songUrl) {
     }
 }
 
-async function scrapeArtistInfo(page, artistUrl) {
+async function scrapeArtistInfo(artistUrl) {
     try {
         const aboutUrl = artistUrl.endsWith('/') ? artistUrl + 'about' : artistUrl + '/about';
         console.log(`  擷取音樂人資訊: ${aboutUrl}`);
 
-        await page.goto(aboutUrl, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+        // Make HTTP request to get the about page HTML
+        const response = await axiosInstance.get(aboutUrl);
+        const $ = cheerio.load(response.data);
 
-        // Wait for content to render
-        try {
-            await page.waitForSelector('[class*="about"], [class*="profile"], [class*="user-page"]', {
-                timeout: SELECTOR_TIMEOUT
+        let category = '';
+        let bio = '';
+
+        // Find category using regex first
+        const pageText = $.text();
+        const categoryRegex = /音樂人類別[：:\s]*([^\n\r\t]+)/i;
+        const categoryMatch = pageText.match(categoryRegex);
+
+        if (categoryMatch && categoryMatch[1]) {
+            category = categoryMatch[1].trim();
+        } else {
+            // Look for elements containing "音樂人類別"
+            $('*').each((i, el) => {
+                const text = $(el).text();
+                if (text && text.includes('音樂人類別')) {
+                    const match = text.match(/音樂人類別[：:\s]*([^\n\r]+)/);
+                    if (match && match[1]) {
+                        category = match[1].trim();
+                        return false; // break the loop
+                    }
+                    // Check next sibling
+                    const nextSibling = $(el).next();
+                    if (nextSibling.length) {
+                        const siblingText = nextSibling.text().trim();
+                        if (siblingText && siblingText.length < 50) {
+                            category = siblingText;
+                            return false; // break the loop
+                        }
+                    }
+                }
             });
-        } catch (e) {
-            await new Promise(r => setTimeout(r, 2000));
         }
 
-        const artistInfo = await page.evaluate(() => {
-            let category = '';
-            let bio = '';
-
-            const pageText = document.body.textContent;
-
-            // Find category
-            const categoryRegex = /音樂人類別[：:\s]*([^\n\r\t]+)/i;
-            const categoryMatch = pageText.match(categoryRegex);
-            if (categoryMatch && categoryMatch[1]) {
-                category = categoryMatch[1].trim();
-            } else {
-                const allEls = document.querySelectorAll('*');
-                for (const el of allEls) {
-                    const t = el.textContent;
-                    if (t && t.includes('音樂人類別')) {
-                        const m = t.match(/音樂人類別[：:\s]*([^\n\r]+)/);
-                        if (m && m[1]) { category = m[1].trim(); break; }
-                        if (el.nextElementSibling) {
-                            const s = el.nextElementSibling.textContent.trim();
-                            if (s && s.length < 50) { category = s; break; }
+        // Find bio by looking for "介紹" heading
+        $('*').each((i, el) => {
+            const text = $(el).text().trim();
+            if (text === '介紹') {
+                // Look in parent container
+                let container = $(el).parent();
+                while (container.length && !bio) {
+                    const containerText = container.text();
+                    if (containerText && containerText.length > 20) {
+                        const introIndex = containerText.indexOf('介紹');
+                        if (introIndex !== -1) {
+                            const afterIntro = containerText.substring(introIndex + 2);
+                            const lines = afterIntro.split('\n')
+                                .map(l => l.trim())
+                                .filter(l => l && !l.includes('關於') && !l.includes('音樂人類別') && l !== '介紹');
+                            if (lines.length > 0) {
+                                bio = lines.join('\n').trim();
+                                break;
+                            }
                         }
                     }
-                }
-            }
-
-            // Find bio
-            const allEls = document.querySelectorAll('*');
-            const introEl = Array.from(allEls).find(el => el.textContent && el.textContent.trim() === '介紹');
-
-            if (introEl) {
-                let container = introEl.parentElement;
-                while (container && !bio) {
-                    const ct = container.textContent;
-                    if (ct && ct.length > 20) {
-                        const idx = ct.indexOf('介紹');
-                        if (idx !== -1) {
-                            const after = ct.substring(idx + 2);
-                            const lines = after.split('\n').map(l => l.trim()).filter(l => l && !l.includes('關於') && !l.includes('音樂人類別') && l !== '介紹');
-                            if (lines.length > 0) { bio = lines.join('\n').trim(); break; }
-                        }
-                    }
-                    container = container.parentElement;
+                    container = container.parent();
                 }
 
+                // If still no bio, check next siblings
                 if (!bio) {
-                    let next = introEl.nextElementSibling;
+                    let nextEl = $(el).next();
                     const bioLines = [];
-                    let max = 10;
-                    while (next && max > 0) {
-                        const t = next.textContent.trim();
-                        if (t && !t.includes('關於')) bioLines.push(t);
-                        next = next.nextElementSibling;
-                        max--;
-                        if (next && next.tagName && next.tagName.match(/^H[1-6]$/)) break;
-                    }
-                    if (bioLines.length) bio = bioLines.join('\n');
-                }
-            }
+                    let maxSiblings = 10;
 
-            return { category: category || '未找到類別', bio: bio || '未找到介紹' };
+                    while (nextEl.length && maxSiblings > 0) {
+                        const siblingText = nextEl.text().trim();
+                        if (siblingText && !siblingText.includes('關於')) {
+                            bioLines.push(siblingText);
+                        }
+                        nextEl = nextEl.next();
+                        maxSiblings--;
+
+                        // Stop if we encounter another heading
+                        if (nextEl.length && nextEl.get(0).tagName && nextEl.get(0).tagName.match(/^H[1-6]$/i)) {
+                            break;
+                        }
+                    }
+
+                    if (bioLines.length) {
+                        bio = bioLines.join('\n').trim();
+                    }
+                }
+
+                return false; // break the loop
+            }
         });
 
-        return artistInfo;
+        return {
+            category: category || '未找到類別',
+            bio: bio || '未找到介紹'
+        };
     } catch (error) {
         console.error(`  擷取音樂人資訊失敗 ${artistUrl}:`, error.message);
         return { category: '擷取失敗', bio: '擷取失敗' };
@@ -343,16 +297,15 @@ async function scrapeArtistInfo(page, artistUrl) {
 
 // ====== Parallel Processing Engine ======
 
-async function processRowBatch(pages, rows, options, worksheet, newColumns, startIdx, totalRows) {
+async function processRowBatch(rows, options, worksheet, newColumns, startIdx, totalRows) {
     const tasks = rows.map((row, batchIdx) => {
-        const pageIdx = batchIdx % pages.length;
         const globalIdx = startIdx + batchIdx;
-        return processOneRow(pages[pageIdx], row, options, worksheet, newColumns, globalIdx, totalRows);
+        return processOneRow(row, options, worksheet, newColumns, globalIdx, totalRows);
     });
     return Promise.all(tasks);
 }
 
-async function processOneRow(page, row, options, worksheet, newColumns, idx, totalRows) {
+async function processOneRow(row, options, worksheet, newColumns, idx, totalRows) {
     const progress = Math.round(((idx + 1) / totalRows) * 100);
     const label = `[${idx + 1}/${totalRows}] ${row['作品名稱']}`;
 
@@ -370,7 +323,7 @@ async function processOneRow(page, row, options, worksheet, newColumns, idx, tot
         // Extract lyrics
         if (options.includes('lyrics')) {
             if (row['作品名稱_hyperlink']) {
-                const lyrics = await scrapeLyrics(page, row['作品名稱_hyperlink']);
+                const lyrics = await scrapeLyrics(row['作品名稱_hyperlink']);
                 worksheet.getCell(row.rowNumber, newColumns.lyrics).value = lyrics;
 
                 io.emit('progress', {
@@ -392,7 +345,7 @@ async function processOneRow(page, row, options, worksheet, newColumns, idx, tot
             if (row['作者_hyperlink']) {
                 // Use cached result if available
                 if (!row._artistInfo) {
-                    row._artistInfo = await scrapeArtistInfo(page, row['作者_hyperlink']);
+                    row._artistInfo = await scrapeArtistInfo(row['作者_hyperlink']);
                     await new Promise(r => setTimeout(r, REQUEST_DELAY));
                 }
 
@@ -448,8 +401,6 @@ app.post('/process', upload.single('file'), async (req, res) => {
         return res.status(400).json({ error: '請上傳檔案' });
     }
 
-    let pages = [];
-
     try {
         const options = JSON.parse(req.body.options);
         const filePath = req.file.path;
@@ -457,10 +408,6 @@ app.post('/process', upload.single('file'), async (req, res) => {
         console.log('開始處理檔案:', req.file.originalname);
         console.log('處理選項:', options);
         console.log(`並行數: ${CONCURRENCY}, 請求間隔: ${REQUEST_DELAY}ms`);
-
-        // Initialize browser and page pool
-        await initBrowser();
-        pages = await createPagePool(CONCURRENCY);
 
         // Parse Excel file
         const { workbook, worksheet, data } = await parseExcelFile(filePath);
@@ -501,7 +448,7 @@ app.post('/process', upload.single('file'), async (req, res) => {
             current: 0,
             total: data.length,
             status: `準備處理 ${data.length} 筆資料（${CONCURRENCY} 並行）...`,
-            log: `找到 ${data.length} 筆資料，使用 ${CONCURRENCY} 個並行頁面開始處理`
+            log: `找到 ${data.length} 筆資料，使用 ${CONCURRENCY} 個並行請求開始處理`
         });
 
         // Process in batches of CONCURRENCY
@@ -520,7 +467,7 @@ app.post('/process', upload.single('file'), async (req, res) => {
                 }
             }
 
-            await processRowBatch(pages, batch, options, worksheet, newColumns, i, data.length);
+            await processRowBatch(batch, options, worksheet, newColumns, i, data.length);
 
             // Post-process: cache artist info from this batch
             if (options.includes('category') || options.includes('bio')) {
@@ -549,10 +496,6 @@ app.post('/process', upload.single('file'), async (req, res) => {
 
         console.log('處理完成，輸出檔案:', outputPath);
 
-        // Close page pool
-        await closePagePool(pages);
-        pages = [];
-
         res.download(outputPath, `processed_${req.file.originalname}`, (err) => {
             if (err) console.error('下載失敗:', err);
             fs.unlink(filePath, () => {});
@@ -561,8 +504,6 @@ app.post('/process', upload.single('file'), async (req, res) => {
 
     } catch (error) {
         console.error('處理失敗:', error);
-        // Clean up page pool on error
-        if (pages.length) await closePagePool(pages);
         res.status(500).json({ error: error.message });
         if (req.file) fs.unlink(req.file.path, () => {});
     }
@@ -577,18 +518,17 @@ app.get('/health', (req, res) => {
 server.listen(PORT, () => {
     console.log(`服務器已啟動在 http://localhost:${PORT}`);
     console.log(`並行數: ${CONCURRENCY} | 請求間隔: ${REQUEST_DELAY}ms`);
+    console.log('使用 HTTP 請求抓取（無需 Chrome 瀏覽器）');
     console.log('請在瀏覽器中開啟上述網址使用工具');
 });
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n正在關閉服務器...');
-    if (browser) await browser.close();
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
     console.log('\n正在關閉服務器...');
-    if (browser) await browser.close();
     process.exit(0);
 });
