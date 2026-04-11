@@ -1,0 +1,7 @@
+name = "streetvoice-scraper"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Static assets (serves public/index.html etc.)
+assets = { directory = "./public", not_found_handling = "none" }

@@ -5,10 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="light dark">
     <title>StreetVoice 資料擷取工具</title>
-    <script src="/socket.io/socket.io.js"></script>
+    <!-- SSE-based progress (no Socket.IO needed) -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
     <style>
         *, *::before, *::after {
             margin: 0;
@@ -866,14 +867,6 @@
     <script>
         let selectedFile = null;
         let processing = false;
-        let socket = null;
-
-        function initSocket() {
-            socket = io();
-            socket.on('connect', () => console.log('Connected'));
-            socket.on('disconnect', () => console.log('Disconnected'));
-            socket.on('progress', (data) => updateProgress(data));
-        }
 
         const fileInput = document.getElementById('fileInput');
         const uploadSection = document.getElementById('uploadSection');
@@ -931,7 +924,7 @@
             processing = true;
             processBtn.disabled = true;
             processBtn.classList.add('loading');
-            document.getElementById('processBtnText').textContent = '處理中...';
+            document.getElementById('processBtnText').textContent = '上傳中...';
 
             const progressSection = document.getElementById('progressSection');
             const downloadSection = document.getElementById('downloadSection');
@@ -939,49 +932,313 @@
             downloadSection.style.display = 'none';
             document.getElementById('statusLog').innerHTML = '';
 
-            const formData = new FormData();
-            formData.append('file', selectedFile);
-            formData.append('options', JSON.stringify(selectedOptions));
+            const ROW_CONCURRENCY = 10;
+            let downloadObjectUrl = null;
+
+            // Fetch one HTML page through the worker proxy
+            async function fetchHtml(url) {
+                const res = await fetch('/fetch?url=' + encodeURIComponent(url));
+                if (!res.ok) throw new Error('proxy ' + res.status);
+                return res.text();
+            }
+
+            // Convert an element to readable text, treating <br>, <p>, <div>, <h*>
+            // as line breaks (DOM textContent collapses them all into nothing).
+            function elementToText(el) {
+                const out = [];
+                const blockTags = new Set(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'tr']);
+                function walk(node) {
+                    if (node.nodeType === 3) { // text node
+                        const t = node.nodeValue;
+                        if (t) out.push(t);
+                        return;
+                    }
+                    if (node.nodeType !== 1) return;
+                    const tag = node.tagName.toLowerCase();
+                    if (tag === 'script' || tag === 'style') return;
+                    if (tag === 'br') { out.push('\n'); return; }
+                    const isBlock = blockTags.has(tag);
+                    if (isBlock) out.push('\n');
+                    for (const child of node.childNodes) walk(child);
+                    if (isBlock) out.push('\n');
+                }
+                walk(el);
+                return out.join('')
+                    .split('\n')
+                    .map(l => l.trim())
+                    .filter(Boolean)
+                    .join('\n');
+            }
+
+            // Find a header element whose first text token matches `headerText`
+            // (e.g. <h2>歌詞 <span class="badge">動態歌詞</span></h2> still matches "歌詞").
+            // Returns the joined text of all following sibling elements until a section
+            // boundary (next header, <hr>, or a wrapper containing another header).
+            function getContentAfterHeader(doc, headerText) {
+                const headers = doc.querySelectorAll('h1, h2, h3, h4, h5, h6');
+                for (const h of headers) {
+                    const raw = (h.textContent || '').trim();
+                    if (!raw) continue;
+                    const firstToken = raw.split(/\s+/)[0];
+                    if (firstToken !== headerText) continue;
+                    const parts = [];
+                    let next = h.nextElementSibling;
+                    while (next) {
+                        const tag = next.tagName.toLowerCase();
+                        // Section boundaries: another heading or a horizontal rule
+                        if (/^h[1-6]$/.test(tag)) break;
+                        if (tag === 'hr') break;
+                        // Wrapper that contains a heading inside (e.g. comments block)
+                        if (next.querySelector && next.querySelector('h1, h2, h3, h4, h5, h6')) break;
+                        const t = elementToText(next);
+                        if (t) parts.push(t);
+                        next = next.nextElementSibling;
+                    }
+                    const joined = parts.join('\n').trim();
+                    if (joined) return joined;
+                }
+                return null;
+            }
+
+            function cleanLyricsText(text) {
+                if (!text) return null;
+                let t = text
+                    .replace(/\.\.\.查看更多[\s\S]*$/g, '')
+                    .replace(/查看更多[\s\S]*$/g, '')
+                    .replace(/收合[\s\S]*$/g, '');
+                // Drop the "歌詞" header line if it slipped through.
+                t = t.replace(/^\s*歌詞\s*\n?/, '');
+                t = t.split('\n').map(l => l.trim()).filter(Boolean).join('\n');
+                return t.trim() || null;
+            }
+
+            function parseLyrics(html) {
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+
+                // Primary: <h2>歌詞</h2> + following content elements
+                const fromHeader = cleanLyricsText(getContentAfterHeader(doc, '歌詞'));
+                if (fromHeader && fromHeader.length > 5) return fromHeader;
+
+                // Fallback: legacy .work-page-container-right structure
+                const right = doc.querySelector('.work-page-container-right');
+                if (right) {
+                    const cleaned = cleanLyricsText(elementToText(right));
+                    if (cleaned && cleaned.length > 20 && /[\u4e00-\u9fff]/.test(cleaned)) {
+                        return cleaned;
+                    }
+                }
+
+                return null;
+            }
+
+            function parseArtistInfo(html) {
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                let category = null;
+                let bio = null;
+
+                // Category: search for "音樂人類別：xxx" pattern in page text
+                const pageText = doc.body ? (doc.body.textContent || '') : '';
+                const m = pageText.match(/音樂人類別[：:\s]*([^\n\r\t]+)/);
+                if (m && m[1]) category = m[1].trim() || null;
+
+                // Bio: <h2>介紹</h2> + following <p> blocks until next header
+                const rawBio = getContentAfterHeader(doc, '介紹');
+                if (rawBio) {
+                    const cleaned = rawBio
+                        .split('\n')
+                        .map(l => l.trim())
+                        .filter(l => l && l !== '介紹')
+                        .join('\n')
+                        .trim();
+                    if (cleaned) bio = cleaned;
+                }
+
+                return { category, bio };
+            }
+
+            // Cache in-flight artist info promises so each artist is fetched once
+            const artistInfoCache = new Map();
+            function getArtistInfo(artistUrl) {
+                let p = artistInfoCache.get(artistUrl);
+                if (!p) {
+                    const aboutUrl = artistUrl.endsWith('/') ? artistUrl + 'about' : artistUrl + '/about';
+                    p = fetchHtml(aboutUrl)
+                        .then(parseArtistInfo)
+                        .catch(() => ({ category: '擷取失敗', bio: '擷取失敗' }));
+                    artistInfoCache.set(artistUrl, p);
+                }
+                return p;
+            }
 
             try {
-                const response = await fetch('/process', { method: 'POST', body: formData });
+                // Step 1: Parse Excel locally (browser)
+                document.getElementById('processBtnText').textContent = '解析中...';
+                const fileBuffer = await selectedFile.arrayBuffer();
+                const workbook = new ExcelJS.Workbook();
+                await workbook.xlsx.load(fileBuffer);
+                const worksheet = workbook.getWorksheet(1);
+                if (!worksheet) throw new Error('Excel 檔案中沒有找到工作表');
 
-                if (response.ok) {
-                    const result = await response.blob();
-                    const downloadUrl = URL.createObjectURL(result);
-                    document.getElementById('downloadBtn').href = downloadUrl;
-                    document.getElementById('downloadBtn').download = `processed_${selectedFile.name}`;
-                    downloadSection.style.display = 'block';
-                    progressSection.style.display = 'none';
-                    showAlert('檔案處理完成！', 'success');
-                } else {
-                    const error = await response.text();
-                    throw new Error(error);
+                const headers = [];
+                worksheet.getRow(1).eachCell((cell, colNumber) => {
+                    headers[colNumber] = cell.text;
+                });
+                const songNameCol = headers.findIndex(h => h === '作品名稱') + 1;
+                const artistCol = headers.findIndex(h => h === '作者') + 1;
+                if (!songNameCol || !artistCol) {
+                    throw new Error('Excel 檔案必須包含「作品名稱」和「作者」欄位');
                 }
+
+                const rows = [];
+                worksheet.eachRow((row, rowNumber) => {
+                    if (rowNumber === 1) return;
+                    const rowData = {};
+                    row.eachCell((cell, colNumber) => {
+                        const header = headers[colNumber];
+                        if (!header) return;
+                        rowData[header] = cell.text;
+                        if (cell.hyperlink) {
+                            const hyperlinkUrl = cell.hyperlink.hyperlink || cell.hyperlink.target || cell.hyperlink;
+                            rowData[`${header}_hyperlink`] = hyperlinkUrl;
+                        }
+                    });
+                    if (rowData['作品名稱'] && rowData['作者']) {
+                        rows.push({
+                            rowNumber,
+                            songName: rowData['作品名稱'],
+                            artist: rowData['作者'],
+                            songUrl: rowData['作品名稱_hyperlink'] || null,
+                            artistUrl: rowData['作者_hyperlink'] || null,
+                        });
+                    }
+                });
+
+                const totalRows = rows.length;
+                const wantLyrics = selectedOptions.includes('lyrics');
+                const wantCategory = selectedOptions.includes('category');
+                const wantBio = selectedOptions.includes('bio');
+                const wantArtist = wantCategory || wantBio;
+
+                addLog(`找到 ${totalRows} 筆資料，並行 ${ROW_CONCURRENCY} 列（解析在瀏覽器端執行）`);
+                document.getElementById('processBtnText').textContent = '處理中...';
+
+                // Step 2: For each row, fetch HTML via worker proxy and parse locally
+                const allResults = new Array(rows.length);
+                let completed = 0;
+
+                async function processRow(row, idx) {
+                    const result = { rowNumber: row.rowNumber };
+
+                    const lyricsTask = (wantLyrics && row.songUrl)
+                        ? fetchHtml(row.songUrl).then(parseLyrics).catch(() => null)
+                        : Promise.resolve(null);
+
+                    const artistTask = (wantArtist && row.artistUrl)
+                        ? getArtistInfo(row.artistUrl)
+                        : Promise.resolve(null);
+
+                    const [lyrics, artist] = await Promise.all([lyricsTask, artistTask]);
+
+                    // Always write a value for selected columns; use "-" as a placeholder
+                    // when nothing was extracted.
+                    if (wantLyrics) result.lyrics = lyrics || '-';
+                    if (wantCategory) result.category = (artist && artist.category) || '-';
+                    if (wantBio) result.bio = (artist && artist.bio) || '-';
+
+                    allResults[idx] = result;
+                    completed++;
+                    addLog(`[${completed}/${totalRows}] ${row.songName} (${row.artist}) 完成`);
+                    updateProgress({
+                        progress: Math.round((completed / totalRows) * 100),
+                        current: completed,
+                        total: totalRows,
+                        status: `已完成 ${completed} / ${totalRows}`,
+                    });
+                }
+
+                let rowCursor = 0;
+                async function worker() {
+                    while (rowCursor < rows.length) {
+                        const myIdx = rowCursor++;
+                        await processRow(rows[myIdx], myIdx);
+                    }
+                }
+                const workers = Array.from(
+                    { length: Math.min(ROW_CONCURRENCY, rows.length) },
+                    () => worker()
+                );
+                await Promise.all(workers);
+
+                // Step 3: Build final Excel locally (browser)
+                addLog('正在產生 Excel 檔案...');
+
+                let newColIndex = worksheet.columnCount + 1;
+                const newColumns = {};
+                if (selectedOptions.includes('lyrics')) {
+                    worksheet.getCell(1, newColIndex).value = '歌詞';
+                    newColumns.lyrics = newColIndex++;
+                }
+                if (selectedOptions.includes('category')) {
+                    worksheet.getCell(1, newColIndex).value = '音樂人類別';
+                    newColumns.category = newColIndex++;
+                }
+                if (selectedOptions.includes('bio')) {
+                    worksheet.getCell(1, newColIndex).value = '音樂人介紹';
+                    newColumns.bio = newColIndex++;
+                }
+                for (const result of allResults) {
+                    if (!result) continue;
+                    if (result.lyrics && newColumns.lyrics) {
+                        worksheet.getCell(result.rowNumber, newColumns.lyrics).value = result.lyrics;
+                    }
+                    if (result.category && newColumns.category) {
+                        worksheet.getCell(result.rowNumber, newColumns.category).value = result.category;
+                    }
+                    if (result.bio && newColumns.bio) {
+                        worksheet.getCell(result.rowNumber, newColumns.bio).value = result.bio;
+                    }
+                }
+
+                const outputBuffer = await workbook.xlsx.writeBuffer();
+                const blob = new Blob([outputBuffer], {
+                    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                });
+                downloadObjectUrl = URL.createObjectURL(blob);
+
+                const downloadBtn = document.getElementById('downloadBtn');
+                downloadBtn.href = downloadObjectUrl;
+                downloadBtn.download = `processed_${selectedFile.name}`;
+                downloadSection.style.display = 'block';
+                progressSection.style.display = 'none';
+                showAlert('檔案處理完成！', 'success');
+                resetBtn();
             } catch (error) {
                 showAlert(`處理失敗: ${error.message}`, 'error');
                 progressSection.style.display = 'none';
-            } finally {
-                processing = false;
-                processBtn.disabled = false;
-                processBtn.classList.remove('loading');
-                document.getElementById('processBtnText').textContent = '開始處理';
+                resetBtn();
             }
         }
 
+        function resetBtn() {
+            processing = false;
+            processBtn.disabled = false;
+            processBtn.classList.remove('loading');
+            document.getElementById('processBtnText').textContent = '開始處理';
+        }
+
+        function addLog(text) {
+            const statusLog = document.getElementById('statusLog');
+            const time = new Date().toLocaleTimeString();
+            statusLog.innerHTML += `<div class="log-entry"><span class="log-time">${time}</span>${text}</div>`;
+            statusLog.scrollTop = statusLog.scrollHeight;
+        }
+
         function updateProgress(data) {
-            const { progress, current, total, status, log } = data;
+            const { progress, current, total, status } = data;
             document.getElementById('progressFill').style.width = `${progress}%`;
             document.getElementById('progressPercentage').textContent = `${progress}%`;
             document.getElementById('progressStatus').textContent = status;
             document.getElementById('progressCount').textContent = `${current} / ${total}`;
-
-            if (log) {
-                const statusLog = document.getElementById('statusLog');
-                const time = new Date().toLocaleTimeString();
-                statusLog.innerHTML += `<div class="log-entry"><span class="log-time">${time}</span>${log}</div>`;
-                statusLog.scrollTop = statusLog.scrollHeight;
-            }
         }
 
         function getSelectedOptions() {
@@ -1004,8 +1261,6 @@
             container.appendChild(alert);
             setTimeout(() => alert.remove(), 5000);
         }
-
-        document.addEventListener('DOMContentLoaded', () => initSocket());
     </script>
 </body>
 </html>
